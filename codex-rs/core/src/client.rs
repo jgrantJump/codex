@@ -98,6 +98,7 @@ use tracing::warn;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::context_manager::repair_incomplete_reasoning_items;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::CoreAuthProvider;
@@ -256,6 +257,14 @@ impl WebsocketSession {
 enum WebsocketStreamOutcome {
     Stream(ResponseStream),
     FallbackToHttp,
+}
+
+enum PreparedWebsocketStream {
+    Stream {
+        stream: ResponseStream,
+        last_response_rx: oneshot::Receiver<LastResponse>,
+    },
+    Retry(Box<ResponsesApiRequest>),
 }
 
 impl ModelClient {
@@ -856,6 +865,27 @@ impl ModelClientSession {
         Ok(request)
     }
 
+    fn repaired_request_after_missing_reasoning_error(
+        error: &ApiError,
+        request: &ResponsesApiRequest,
+    ) -> Option<ResponsesApiRequest> {
+        if !is_missing_reasoning_following_item_error(error) {
+            return None;
+        }
+
+        let mut repaired_request = request.clone();
+        let removed_count = repair_incomplete_reasoning_items(&mut repaired_request.input);
+        if removed_count == 0 || repaired_request.input == request.input {
+            return None;
+        }
+
+        warn!(
+            removed_count,
+            "responses request contained orphan reasoning item(s); retrying with repaired history"
+        );
+        Some(repaired_request)
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///
@@ -1134,6 +1164,7 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut repaired_request: Option<ResponsesApiRequest> = None;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -1151,21 +1182,25 @@ impl ModelClientSession {
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
             let options = self.build_responses_options(turn_metadata_header, compression);
 
-            let request = self.build_responses_request(
-                &client_setup.api_provider,
-                prompt,
-                model_info,
-                effort,
-                summary,
-                service_tier,
-            )?;
+            let request = if let Some(request) = repaired_request.clone() {
+                request
+            } else {
+                self.build_responses_request(
+                    &client_setup.api_provider,
+                    prompt,
+                    model_info,
+                    effort,
+                    summary,
+                    service_tier,
+                )?
+            };
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-            let stream_result = client.stream_request(request, options).await;
+            let stream_result = client.stream_request(request.clone(), options).await;
 
             match stream_result {
                 Ok(stream) => {
@@ -1185,7 +1220,15 @@ impl ModelClientSession {
                     );
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    if let Some(repaired) =
+                        Self::repaired_request_after_missing_reasoning_error(&err, &request)
+                    {
+                        repaired_request = Some(repaired);
+                        continue;
+                    }
+                    return Err(map_api_error(err));
+                }
             }
         }
     }
@@ -1223,6 +1266,7 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut repaired_request: Option<ResponsesApiRequest> = None;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
@@ -1233,14 +1277,18 @@ impl ModelClientSession {
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
 
             let options = self.build_responses_options(turn_metadata_header, compression);
-            let request = self.build_responses_request(
-                &client_setup.api_provider,
-                prompt,
-                model_info,
-                effort,
-                summary,
-                service_tier,
-            )?;
+            let request = if let Some(request) = repaired_request.clone() {
+                request
+            } else {
+                self.build_responses_request(
+                    &client_setup.api_provider,
+                    prompt,
+                    model_info,
+                    effort,
+                    summary,
+                    service_tier,
+                )?
+            };
             let mut ws_payload = ResponseCreateWsRequest {
                 client_metadata: response_create_client_metadata(
                     Some(self.client.build_ws_client_metadata(turn_metadata_header)),
@@ -1289,7 +1337,7 @@ impl ModelClientSession {
             }
 
             let ws_request = self.prepare_websocket_request(ws_payload, &request);
-            self.websocket_session.last_request = Some(request);
+            self.websocket_session.last_request = Some(request.clone());
             let stream_result = self.websocket_session.connection.as_ref().ok_or_else(|| {
                 map_api_error(ApiError::Stream(
                     "websocket connection is unavailable".to_string(),
@@ -1297,13 +1345,76 @@ impl ModelClientSession {
             })?;
             let stream_result = stream_result
                 .stream_request(ws_request, self.websocket_session.connection_reused())
-                .await
-                .map_err(map_api_error)?;
-            let (stream, last_request_rx) =
-                map_response_stream(stream_result, session_telemetry.clone());
-            self.websocket_session.last_response_rx = Some(last_request_rx);
-            return Ok(WebsocketStreamOutcome::Stream(stream));
+                .await;
+            let stream_result = match stream_result {
+                Ok(stream_result) => stream_result,
+                Err(err) => {
+                    self.websocket_session.last_request = None;
+                    if let Some(repaired) =
+                        Self::repaired_request_after_missing_reasoning_error(&err, &request)
+                    {
+                        repaired_request = Some(repaired);
+                        continue;
+                    }
+                    return Err(map_api_error(err));
+                }
+            };
+            match Self::prepare_websocket_stream(stream_result, session_telemetry.clone(), &request)
+                .await?
+            {
+                PreparedWebsocketStream::Stream {
+                    stream,
+                    last_response_rx,
+                } => {
+                    self.websocket_session.last_response_rx = Some(last_response_rx);
+                    return Ok(WebsocketStreamOutcome::Stream(stream));
+                }
+                PreparedWebsocketStream::Retry(repaired) => {
+                    self.reset_websocket_session();
+                    repaired_request = Some(*repaired);
+                    continue;
+                }
+            }
         }
+    }
+
+    async fn prepare_websocket_stream(
+        mut api_stream: codex_api::ResponseStream,
+        session_telemetry: SessionTelemetry,
+        request: &ResponsesApiRequest,
+    ) -> Result<PreparedWebsocketStream> {
+        // Wrapped websocket validation errors arrive as the first request-owned event rather than
+        // from `stream_request(...)`, so buffer transport preface events until we know whether the
+        // request was accepted or should be repaired and retried.
+        let mut buffered_events = Vec::new();
+
+        while let Some(event) = api_stream.next().await {
+            match event {
+                Ok(event) => {
+                    let should_keep_buffering = is_websocket_preface_event(&event);
+                    buffered_events.push(Ok(event));
+                    if should_keep_buffering {
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => {
+                    if let Some(repaired) =
+                        Self::repaired_request_after_missing_reasoning_error(&err, request)
+                    {
+                        return Ok(PreparedWebsocketStream::Retry(Box::new(repaired)));
+                    }
+                    return Err(map_api_error(err));
+                }
+            }
+        }
+
+        let api_stream = prepend_buffered_api_events(buffered_events, api_stream);
+        let (stream, last_response_rx) = map_response_stream(api_stream, session_telemetry);
+        Ok(PreparedWebsocketStream::Stream {
+            stream,
+            last_response_rx,
+        })
     }
 
     /// Builds request and SSE telemetry for streaming API calls.
@@ -1466,6 +1577,56 @@ impl ModelClientSession {
         self.websocket_session = WebsocketSession::default();
         activated
     }
+}
+
+fn is_missing_reasoning_following_item_error(error: &ApiError) -> bool {
+    let message = match error {
+        ApiError::InvalidRequest { message } => message.as_str(),
+        ApiError::Transport(TransportError::Http {
+            status,
+            body: Some(body),
+            ..
+        }) if *status == StatusCode::BAD_REQUEST => body.as_str(),
+        _ => return false,
+    };
+
+    message.contains("type 'reasoning'") && message.contains("required following item")
+}
+
+fn is_websocket_preface_event(event: &ResponseEvent) -> bool {
+    matches!(
+        event,
+        ResponseEvent::ServerModel(_)
+            | ResponseEvent::ServerReasoningIncluded(_)
+            | ResponseEvent::ModelsEtag(_)
+            | ResponseEvent::RateLimits(_)
+    )
+}
+
+fn prepend_buffered_api_events(
+    buffered_events: Vec<std::result::Result<ResponseEvent, ApiError>>,
+    mut api_stream: codex_api::ResponseStream,
+) -> codex_api::ResponseStream {
+    if buffered_events.is_empty() {
+        return api_stream;
+    }
+
+    let (tx_event, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
+    tokio::spawn(async move {
+        for event in buffered_events {
+            if tx_event.send(event).await.is_err() {
+                return;
+            }
+        }
+
+        while let Some(event) = api_stream.next().await {
+            if tx_event.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    codex_api::ResponseStream { rx_event }
 }
 
 /// Parses per-turn metadata into an HTTP header value.

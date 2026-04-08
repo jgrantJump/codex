@@ -30,6 +30,9 @@ use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use std::path::PathBuf;
 
+use crate::contextual_user_message::TURN_ABORTED_CLOSE_TAG;
+use crate::contextual_user_message::TURN_ABORTED_OPEN_TAG;
+
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
@@ -176,6 +179,12 @@ fn reasoning_with_encrypted_content(len: usize) -> ResponseItem {
         content: None,
         encrypted_content: Some("a".repeat(len)),
     }
+}
+
+fn turn_aborted_msg() -> ResponseItem {
+    user_input_text_msg(&format!(
+        "{TURN_ABORTED_OPEN_TAG}\ninterrupted\n{TURN_ABORTED_CLOSE_TAG}"
+    ))
 }
 
 fn truncate_exec_output(content: &str) -> String {
@@ -1347,6 +1356,80 @@ fn normalize_removes_orphan_function_call_output() {
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(h.raw_items(), vec![]);
+}
+
+#[test]
+fn normalize_keeps_reasoning_followed_by_function_call() {
+    let reasoning = reasoning_msg("thinking...");
+    let function_call = ResponseItem::FunctionCall {
+        id: None,
+        name: "shell".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "call-1".to_string(),
+    };
+    let function_output = ResponseItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload::from_text("ok".to_string()),
+    };
+    let mut history = create_history_with_items(vec![
+        user_msg("run it"),
+        reasoning.clone(),
+        function_call.clone(),
+        function_output.clone(),
+    ]);
+
+    history.normalize_history(&default_input_modalities());
+
+    assert_eq!(
+        history.raw_items(),
+        vec![
+            user_msg("run it"),
+            reasoning,
+            function_call,
+            function_output,
+        ]
+    );
+}
+
+#[test]
+fn normalize_keeps_reasoning_followed_by_compaction() {
+    let reasoning = reasoning_msg("thinking...");
+    let compaction = ResponseItem::Compaction {
+        encrypted_content: "summary".to_string(),
+    };
+    let mut history = create_history_with_items(vec![
+        user_msg("summarize"),
+        reasoning.clone(),
+        compaction.clone(),
+        user_msg("resume"),
+    ]);
+
+    history.normalize_history(&default_input_modalities());
+
+    assert_eq!(
+        history.raw_items(),
+        vec![
+            user_msg("summarize"),
+            reasoning,
+            compaction,
+            user_msg("resume"),
+        ]
+    );
+}
+
+#[test]
+fn normalize_removes_orphan_reasoning_before_turn_aborted_marker() {
+    let turn_aborted = turn_aborted_msg();
+    let mut history = create_history_with_items(vec![
+        reasoning_msg("thinking..."),
+        turn_aborted.clone(),
+        user_msg("resume"),
+    ]);
+
+    history.normalize_history(&default_input_modalities());
+
+    assert_eq!(history.raw_items(), vec![turn_aborted, user_msg("resume")]);
 }
 
 #[cfg(not(debug_assertions))]

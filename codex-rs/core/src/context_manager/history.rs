@@ -348,13 +348,18 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
-    /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    /// 3. every reasoning item keeps the model-generated item that originally followed it
+    /// 4. when images are unsupported, image content is stripped from messages and tool outputs
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
 
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
+
+        // Responses API reasoning items must be followed by assistant/tool output from the same
+        // turn. Interrupted or resumed histories can otherwise leave behind orphan reasoning items.
+        normalize::repair_incomplete_reasoning_items(&mut self.items);
 
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);

@@ -11,6 +11,39 @@ use tracing::info;
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
 
+fn sanitize_response_input_history(items: &mut Vec<ResponseItem>) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < items.len() {
+        if !matches!(items[index], ResponseItem::Reasoning { .. }) {
+            index += 1;
+            continue;
+        }
+
+        let Some(next_index) = next_non_ghost_item_index(items, index + 1) else {
+            info!("dropping dangling reasoning item at end of history");
+            items.remove(index);
+            changed = true;
+            continue;
+        };
+
+        if reasoning_following_item_is_valid(&items[next_index]) {
+            index = next_index + 1;
+            continue;
+        }
+
+        info!(
+            following_item_type = response_item_type_name(&items[next_index]),
+            "dropping dangling reasoning item without its required following model item"
+        );
+        items.remove(index);
+        changed = true;
+    }
+
+    changed
+}
+
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     // Collect synthetic outputs to insert immediately after their calls.
     // Store the insertion position (index of call) alongside the item so
@@ -194,6 +227,16 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     });
 }
 
+pub(crate) fn repair_incomplete_reasoning_items(items: &mut Vec<ResponseItem>) -> usize {
+    let original_len = items.len();
+    if !sanitize_response_input_history(items) {
+        return 0;
+    }
+    let removed_count = original_len.saturating_sub(items.len());
+    info!(removed_count, "dropped orphan reasoning item(s)");
+    removed_count
+}
+
 pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &ResponseItem) {
     match item {
         ResponseItem::FunctionCall { call_id, .. } => {
@@ -287,6 +330,54 @@ where
 {
     if let Some(pos) = items.iter().position(predicate) {
         items.remove(pos);
+    }
+}
+
+fn next_non_ghost_item_index(items: &[ResponseItem], start: usize) -> Option<usize> {
+    items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, item)| {
+            (!matches!(item, ResponseItem::GhostSnapshot { .. })).then_some(index)
+        })
+}
+
+fn reasoning_following_item_is_valid(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role == "assistant",
+        ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. } => true,
+        ResponseItem::ToolSearchOutput { execution, .. } => execution == "server",
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Other => false,
+    }
+}
+
+fn response_item_type_name(item: &ResponseItem) -> &'static str {
+    match item {
+        ResponseItem::Message { .. } => "message",
+        ResponseItem::Reasoning { .. } => "reasoning",
+        ResponseItem::LocalShellCall { .. } => "local_shell_call",
+        ResponseItem::FunctionCall { .. } => "function_call",
+        ResponseItem::ToolSearchCall { .. } => "tool_search_call",
+        ResponseItem::FunctionCallOutput { .. } => "function_call_output",
+        ResponseItem::CustomToolCall { .. } => "custom_tool_call",
+        ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output",
+        ResponseItem::ToolSearchOutput { .. } => "tool_search_output",
+        ResponseItem::WebSearchCall { .. } => "web_search_call",
+        ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
+        ResponseItem::GhostSnapshot { .. } => "ghost_snapshot",
+        ResponseItem::Compaction { .. } => "compaction",
+        ResponseItem::Other => "other",
     }
 }
 
